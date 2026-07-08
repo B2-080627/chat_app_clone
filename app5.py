@@ -208,7 +208,9 @@ def get_analytics():
 
     daily_counts = pd.Series(dtype=int)
     if not msgs_df.empty:
-        msgs_df["date"] = pd.to_datetime(msgs_df["timestamp"]).dt.date
+        msgs_df["parsed"] = pd.to_datetime(msgs_df["timestamp"], utc=True, errors="coerce")
+        msgs_df = msgs_df.dropna(subset=["parsed"])
+        msgs_df["date"] = msgs_df["parsed"].dt.date
         daily_counts = msgs_df.groupby("date").size()
 
     return {
