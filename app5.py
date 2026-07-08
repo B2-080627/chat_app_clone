@@ -1,8 +1,10 @@
 import streamlit as st
 import sqlite3
 import hashlib
-from datetime import datetime
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from streamlit_autorefresh import st_autorefresh
+from streamlit_js_eval import streamlit_js_eval
 
 # ---------------------------------------------------------------------------
 # CONFIG
@@ -96,7 +98,7 @@ def send_message(sender, receiver, content=None, media_data=None, media_name=Non
     c.execute(
         """INSERT INTO messages (sender, receiver, content, media_data, media_name, media_type, timestamp)
            VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (sender, receiver, content, media_data, media_name, media_type, datetime.now().isoformat()),
+        (sender, receiver, content, media_data, media_name, media_type, datetime.now(timezone.utc).isoformat()),
     )
     conn.commit()
     conn.close()
@@ -123,9 +125,30 @@ init_db()
 # ---------------------------------------------------------------------------
 # UI HELPERS
 # ---------------------------------------------------------------------------
-def format_time(ts: str) -> str:
+def get_viewer_timezone() -> str:
+    """Detect the browser's IANA timezone (e.g. 'Asia/Kolkata') via JS, once per session."""
+    if "timezone" not in st.session_state:
+        st.session_state.timezone = None
+    if st.session_state.timezone is None:
+        tz = streamlit_js_eval(
+            js_expressions="Intl.DateTimeFormat().resolvedOptions().timeZone",
+            key="get_tz",
+        )
+        if tz:
+            st.session_state.timezone = tz
+    return st.session_state.timezone or "UTC"
+
+
+def format_time(ts: str, tz_name: str = "UTC") -> str:
     try:
-        return datetime.fromisoformat(ts).strftime("%I:%M %p")
+        dt = datetime.fromisoformat(ts)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        try:
+            local_dt = dt.astimezone(ZoneInfo(tz_name))
+        except Exception:
+            local_dt = dt.astimezone(timezone.utc)
+        return local_dt.strftime("%I:%M %p")
     except Exception:
         return ""
 
@@ -175,6 +198,7 @@ def login_page():
 def chat_page():
     # Poll every 3 seconds so new messages show up without a manual refresh
     st_autorefresh(interval=3000, key="autorefresh")
+    viewer_tz = get_viewer_timezone()
 
     with st.sidebar:
         st.markdown(f"### 👤 {st.session_state.username}")
@@ -219,28 +243,32 @@ def chat_page():
                         f"""<div style="background-color:{bubble_color}; padding:8px 12px;
                         border-radius:10px; margin-bottom:4px; border:1px solid #ddd;
                         word-wrap:break-word;">
-                        {content}
-                        <div style="font-size:10px; color:gray; text-align:right; margin-top:2px;">
-                        {format_time(ts)}</div>
+                        <span style="color:#000000; font-size:15px;">{content}</span>
+                        <div style="font-size:10px; color:#555555; text-align:right; margin-top:2px;">
+                        {format_time(ts, viewer_tz)}</div>
                         </div>""",
                         unsafe_allow_html=True,
                     )
                 if media_data:
+                    # Media is stored and served at full original quality - no compression is applied.
                     if media_type and media_type.startswith("image"):
-                        st.image(media_data, width=250)
+                        st.image(media_data, use_container_width=True)
                     elif media_type and media_type.startswith("video"):
                         st.video(media_data)
                     elif media_type and media_type.startswith("audio"):
                         st.audio(media_data)
-                    else:
-                        st.download_button(
-                            label=f"📎 {media_name}",
-                            data=media_data,
-                            file_name=media_name,
-                            key=f"dl_{msg_id}",
-                        )
+
+                    # Always offer a download button for any attached media so the
+                    # recipient can save the original, full-quality file.
+                    st.download_button(
+                        label=f"⬇️ Download {media_name}",
+                        data=media_data,
+                        file_name=media_name,
+                        key=f"dl_{msg_id}",
+                        use_container_width=True,
+                    )
                     if not content:
-                        st.caption(format_time(ts))
+                        st.caption(format_time(ts, viewer_tz))
 
     st.divider()
     with st.form("message_form", clear_on_submit=True):
