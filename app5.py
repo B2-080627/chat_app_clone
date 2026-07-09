@@ -1,5 +1,5 @@
 import streamlit as st
-import sqlite3
+import libsql
 import hashlib
 import pandas as pd
 from datetime import datetime, timezone, timedelta
@@ -11,7 +11,6 @@ from streamlit_js_eval import streamlit_js_eval
 # CONFIG
 # ---------------------------------------------------------------------------
 st.set_page_config(page_title="ChatApp", page_icon="💬", layout="wide")
-DB_PATH = "chatapp.db"
 SALT = "chatapp_static_salt_v1"  # not a substitute for per-user salts in production
 
 COMMON_TIMEZONES = [
@@ -40,10 +39,24 @@ def is_owner(username: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# DATABASE HELPERS
+# DATABASE HELPERS (Turso via libsql — persists across redeploys/restarts,
+# unlike a local sqlite file on Streamlit Community Cloud)
 # ---------------------------------------------------------------------------
+@st.cache_resource(show_spinner=False)
 def get_conn():
-    return sqlite3.connect(DB_PATH, check_same_thread=False)
+    """One shared connection per running app process. libsql talks to Turso
+    over HTTP, so this is safe to reuse across reruns and sessions."""
+    if "TURSO_DATABASE_URL" not in st.secrets or "TURSO_AUTH_TOKEN" not in st.secrets:
+        st.error(
+            "Missing Turso credentials. Add TURSO_DATABASE_URL and TURSO_AUTH_TOKEN "
+            "in your app's Secrets (Settings → Secrets on Streamlit Cloud, or "
+            ".streamlit/secrets.toml locally)."
+        )
+        st.stop()
+    return libsql.connect(
+        database=st.secrets["TURSO_DATABASE_URL"],
+        auth_token=st.secrets["TURSO_AUTH_TOKEN"],
+    )
 
 
 def init_db():
@@ -73,14 +86,13 @@ def init_db():
         )
         """
     )
-    # Lightweight migration in case an older DB file is present without the
+    # Lightweight migration in case an older DB is present without the
     # timezone column.
     c.execute("PRAGMA table_info(users)")
     cols = [row[1] for row in c.fetchall()]
     if "timezone" not in cols:
         c.execute("ALTER TABLE users ADD COLUMN timezone TEXT")
     conn.commit()
-    conn.close()
 
 
 def hash_password(password: str) -> str:
@@ -97,10 +109,10 @@ def register_user(username: str, password: str):
         )
         conn.commit()
         return True, "Account created successfully. Please log in."
-    except sqlite3.IntegrityError:
-        return False, "That username is already taken."
-    finally:
-        conn.close()
+    except Exception as e:
+        if "UNIQUE" in str(e).upper() or "CONSTRAINT" in str(e).upper():
+            return False, "That username is already taken."
+        return False, f"Could not create account: {e}"
 
 
 def authenticate_user(username: str, password: str) -> bool:
@@ -108,7 +120,6 @@ def authenticate_user(username: str, password: str) -> bool:
     c = conn.cursor()
     c.execute("SELECT password_hash FROM users WHERE username=?", (username,))
     row = c.fetchone()
-    conn.close()
     return row is not None and row[0] == hash_password(password)
 
 
@@ -117,7 +128,6 @@ def change_password(username: str, new_password: str):
     c = conn.cursor()
     c.execute("UPDATE users SET password_hash=? WHERE username=?", (hash_password(new_password), username))
     conn.commit()
-    conn.close()
 
 
 def get_all_users(exclude: str = None):
@@ -127,9 +137,7 @@ def get_all_users(exclude: str = None):
         c.execute("SELECT username FROM users WHERE username != ? ORDER BY username", (exclude,))
     else:
         c.execute("SELECT username FROM users ORDER BY username")
-    rows = [r[0] for r in c.fetchall()]
-    conn.close()
-    return rows
+    return [r[0] for r in c.fetchall()]
 
 
 def get_user_timezone(username: str):
@@ -137,7 +145,6 @@ def get_user_timezone(username: str):
     c = conn.cursor()
     c.execute("SELECT timezone FROM users WHERE username=?", (username,))
     row = c.fetchone()
-    conn.close()
     return row[0] if row and row[0] else None
 
 
@@ -146,7 +153,6 @@ def set_user_timezone(username: str, tz_name: str):
     c = conn.cursor()
     c.execute("UPDATE users SET timezone=? WHERE username=?", (tz_name, username))
     conn.commit()
-    conn.close()
 
 
 def send_message(sender, receiver, content=None, media_data=None, media_name=None, media_type=None):
@@ -158,7 +164,6 @@ def send_message(sender, receiver, content=None, media_data=None, media_name=Non
         (sender, receiver, content, media_data, media_name, media_type, datetime.now(timezone.utc).isoformat()),
     )
     conn.commit()
-    conn.close()
 
 
 def get_messages(user1, user2):
@@ -171,9 +176,7 @@ def get_messages(user1, user2):
            ORDER BY id ASC""",
         (user1, user2, user2, user1),
     )
-    rows = c.fetchall()
-    conn.close()
-    return rows
+    return c.fetchall()
 
 
 def delete_message(msg_id: int, requester: str):
@@ -182,29 +185,41 @@ def delete_message(msg_id: int, requester: str):
     c = conn.cursor()
     c.execute("DELETE FROM messages WHERE id=? AND sender=?", (msg_id, requester))
     conn.commit()
-    conn.close()
 
 
 # ---------------------------------------------------------------------------
 # ANALYTICS (owner only)
+# Rows are fetched manually via the cursor and assembled into DataFrames,
+# rather than using pandas.read_sql_query, since that helper is only
+# guaranteed to work against sqlite3/SQLAlchemy connections and Turso's
+# client is neither.
 # ---------------------------------------------------------------------------
 def get_analytics():
     conn = get_conn()
-    total_users = pd.read_sql_query("SELECT COUNT(*) AS n FROM users", conn).iloc[0]["n"]
-    total_messages = pd.read_sql_query("SELECT COUNT(*) AS n FROM messages", conn).iloc[0]["n"]
-    total_media = pd.read_sql_query(
-        "SELECT COUNT(*) AS n FROM messages WHERE media_data IS NOT NULL", conn
-    ).iloc[0]["n"]
-    storage_bytes = pd.read_sql_query(
-        "SELECT COALESCE(SUM(LENGTH(media_data)),0) AS b FROM messages", conn
-    ).iloc[0]["b"]
-    users_df = pd.read_sql_query("SELECT username, created_at FROM users ORDER BY created_at", conn)
-    top_senders = pd.read_sql_query(
-        "SELECT sender, COUNT(*) AS messages FROM messages GROUP BY sender ORDER BY messages DESC LIMIT 10",
-        conn,
+    c = conn.cursor()
+
+    c.execute("SELECT COUNT(*) FROM users")
+    total_users = c.fetchone()[0]
+
+    c.execute("SELECT COUNT(*) FROM messages")
+    total_messages = c.fetchone()[0]
+
+    c.execute("SELECT COUNT(*) FROM messages WHERE media_data IS NOT NULL")
+    total_media = c.fetchone()[0]
+
+    c.execute("SELECT COALESCE(SUM(LENGTH(media_data)),0) FROM messages")
+    storage_bytes = c.fetchone()[0]
+
+    c.execute("SELECT username, created_at FROM users ORDER BY created_at")
+    users_df = pd.DataFrame(c.fetchall(), columns=["username", "created_at"])
+
+    c.execute(
+        "SELECT sender, COUNT(*) AS messages FROM messages GROUP BY sender ORDER BY messages DESC LIMIT 10"
     )
-    msgs_df = pd.read_sql_query("SELECT timestamp FROM messages", conn)
-    conn.close()
+    top_senders = pd.DataFrame(c.fetchall(), columns=["sender", "messages"])
+
+    c.execute("SELECT timestamp FROM messages")
+    msgs_df = pd.DataFrame(c.fetchall(), columns=["timestamp"])
 
     daily_counts = pd.Series(dtype=int)
     if not msgs_df.empty:
